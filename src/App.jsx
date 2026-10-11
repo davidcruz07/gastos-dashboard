@@ -215,6 +215,101 @@ function Editor({ mov, categorias, moneda, onClose, onGuardado, onEliminado }) {
   );
 }
 
+function SaldoEditor({ inicial, moneda, onGuardar, onCancelar }) {
+  const [txt, setTxt] = useState(inicial !== null ? inicial.toFixed(2) : '');
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function enviar(e) {
+    e.preventDefault();
+    const n = parseFloat(txt);
+    if (!Number.isFinite(n)) return setErr('Escribe un monto válido.');
+    setBusy(true); setErr(null);
+    const msg = await onGuardar(n);
+    setBusy(false);
+    if (msg) setErr(`No se pudo guardar: ${msg}`);
+  }
+
+  return (
+    <form onSubmit={enviar} className="mt-4 flex flex-wrap items-center gap-2">
+      <input autoFocus type="number" step="0.01" inputMode="decimal" value={txt} onChange={(e) => setTxt(e.target.value)}
+        placeholder={`Saldo actual en ${moneda}`} aria-label="Saldo actual de tu cuenta" className={INPUT} style={{ maxWidth: '14rem' }} />
+      <button disabled={busy} className="px-4 py-1.5 rounded-full text-sm font-semibold bg-[var(--accent)] text-[var(--bg)] disabled:opacity-50">
+        {busy ? 'Guardando…' : 'Guardar saldo'}
+      </button>
+      <Boton type="button" onClick={onCancelar}>Cancelar</Boton>
+      {err && <p className="w-full text-sm text-[var(--out)]">{err}</p>}
+    </form>
+  );
+}
+
+const API = import.meta.env.VITE_API_URL;
+const TIPOS_RESUMEN = [
+  { id: 'semanal', label: 'Semanal' },
+  { id: 'mes_en_curso', label: 'Este mes' },
+  { id: 'mes_anterior', label: 'Mes pasado' },
+];
+
+function Resumen() {
+  const [tipo, setTipo] = useState('semanal');
+  const [items, setItems] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const cargar = useCallback(async () => {
+    const { data } = await supabase.from('resumenes').select('id, tipo, texto, created_at').order('created_at', { ascending: false }).limit(30);
+    const m = {};
+    (data ?? []).forEach((r) => { if (!m[r.tipo]) m[r.tipo] = r; });
+    setItems(m);
+  }, []);
+  useEffect(() => { cargar(); }, [cargar]);
+
+  async function generar() {
+    setBusy(true); setErr(null);
+    try {
+      if (!API) throw new Error('Falta la variable VITE_API_URL');
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error('Inicia sesión para generar resúmenes');
+      const r = await fetch(`${API}/api/resumen`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ tipo, enviar: false }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
+      await cargar();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  }
+
+  const actual = items[tipo];
+  return (
+    <section className="panel p-6 mb-6">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 className="fd text-xl font-bold">Resumen con IA</h2>
+        <div className="flex flex-wrap gap-2">
+          {TIPOS_RESUMEN.map((t) => <Chip key={t.id} activo={tipo === t.id} onClick={() => setTipo(t.id)}>{t.label}</Chip>)}
+        </div>
+      </div>
+      {actual ? (
+        <>
+          <p className="whitespace-pre-line leading-relaxed max-w-prose">{actual.texto}</p>
+          <p className="text-sm text-[var(--muted)] mt-3">
+            Generado el {new Date(actual.created_at).toLocaleDateString('es-MX', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}
+          </p>
+        </>
+      ) : (
+        <p className="text-[var(--muted)]">Aún no hay un resumen de este tipo. Pulsa «Generar ahora» para crear el primero.</p>
+      )}
+      {err && <p className="text-sm text-[var(--out)] mt-3">No se pudo generar: {err}</p>}
+      <div className="mt-4">
+        <button onClick={generar} disabled={busy} className="px-4 py-1.5 rounded-full text-sm font-semibold bg-[var(--accent)] text-[var(--bg)] disabled:opacity-50">
+          {busy ? 'Generando…' : 'Generar ahora'}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function Login() {
   const [email, setEmail] = useState('');
   const [pass, setPass] = useState('');
@@ -257,6 +352,8 @@ function Dashboard() {
   const [busqueda, setBusqueda] = useState('');
   const [limite, setLimite] = useState(40);
   const [editando, setEditando] = useState(null);
+  const [saldos, setSaldos] = useState({});
+  const [editandoSaldo, setEditandoSaldo] = useState(false);
   const [presupuestos, setPresupuestos] = useState(() => {
     try { return JSON.parse(localStorage.getItem('presupuestos') || '{}'); } catch { return {}; }
   });
@@ -265,6 +362,8 @@ function Dashboard() {
     setLoading(true); setError(null);
     const { data, error } = await supabase.from('gastos').select('*').order('created_at', { ascending: false }).limit(2000);
     if (error) setError(error.message); else setGastos(data ?? []);
+    const { data: sd } = await supabase.from('saldos').select('*'); // si la tabla aún no existe, simplemente no hay saldo
+    setSaldos(Object.fromEntries((sd ?? []).map((s) => [s.moneda, s])));
     setLoading(false);
   }, []);
 
@@ -304,6 +403,23 @@ function Dashboard() {
   const gastosPrev = r.prev ? suma(delMoneda.filter((g) => enRango(g, r.prev)), 'gasto') : null;
   const delta = gastosPrev > 0 ? ((gastosT - gastosPrev) / gastosPrev) * 100 : null;
   const pctGasto = ingresosT > 0 ? Math.min(100, (gastosT / ingresosT) * 100) : gastosT > 0 ? 100 : 0;
+
+  // Saldo = el monto que fijaste + ingresos - gastos registrados desde ese momento.
+  const base = saldos[moneda];
+  const saldo = base
+    ? Number(base.monto) + suma(delMoneda.filter((g) => new Date(g.created_at) > new Date(base.desde)), 'ingreso')
+      - suma(delMoneda.filter((g) => new Date(g.created_at) > new Date(base.desde)), 'gasto')
+    : null;
+  const valorHero = saldo !== null ? saldo : balance;
+
+  async function guardarSaldo(monto) {
+    const { data, error } = await supabase.from('saldos')
+      .upsert({ moneda, monto, desde: new Date().toISOString() }, { onConflict: 'moneda' }).select().single();
+    if (error) return error.message;
+    setSaldos((p) => ({ ...p, [moneda]: data }));
+    setEditandoSaldo(false);
+    return null;
+  }
 
   const porCategoria = useMemo(() => {
     const m = {};
@@ -395,11 +511,35 @@ function Dashboard() {
 
         {/* Hero */}
         <section className="pt-12 pb-8">
-          <p className="text-lg text-[var(--muted)]">{per.hero}</p>
+          <p className="text-lg text-[var(--muted)]">{saldo !== null ? 'Saldo en tu cuenta' : per.hero}</p>
           <h1 className="fd nums font-extrabold leading-none tracking-tight text-[clamp(3rem,11vw,7.5rem)] mt-2"
-            style={{ color: balance >= 0 ? 'var(--in)' : 'var(--out)' }}>
-            {balance < 0 && '−'}{fmt(Math.abs(balance), moneda)}
+            style={{ color: valorHero < 0 ? 'var(--out)' : saldo !== null ? 'var(--text)' : 'var(--in)' }}>
+            {valorHero < 0 && '−'}{fmt(Math.abs(valorHero), moneda)}
           </h1>
+          {saldo !== null && !editandoSaldo && (
+            <>
+              <p className="mt-3 text-[var(--muted)]">
+                {per.hero}:{' '}
+                <span className="nums" style={{ color: balance >= 0 ? 'var(--in)' : 'var(--out)' }}>
+                  {balance >= 0 ? '+' : '−'}{fmt(Math.abs(balance), moneda)}
+                </span>
+              </p>
+              <p className="mt-1 text-sm text-[var(--muted)]">
+                Parte del saldo que fijaste el {new Date(base.desde).toLocaleDateString('es-MX', { day: 'numeric', month: 'short' })} y suma lo que entra y resta lo que sale.{' '}
+                <button onClick={() => setEditandoSaldo(true)} className="underline underline-offset-4 hover:text-[var(--text)]">Corregir saldo</button>
+              </p>
+            </>
+          )}
+          {saldo === null && !editandoSaldo && (
+            <p className="mt-3 text-[var(--muted)]">
+              ¿Cuánto tienes hoy en tu cuenta?{' '}
+              <button onClick={() => setEditandoSaldo(true)} className="underline underline-offset-4 hover:text-[var(--text)]">Fijar mi saldo</button>
+              {' '}y se ajustará con cada ingreso y gasto.
+            </p>
+          )}
+          {editandoSaldo && (
+            <SaldoEditor inicial={saldo} moneda={moneda} onGuardar={guardarSaldo} onCancelar={() => setEditandoSaldo(false)} />
+          )}
           {delta !== null && per.vs && (
             <p className="mt-3 text-[var(--muted)]">
               Gastas <span style={{ color: delta <= 0 ? 'var(--in)' : 'var(--out)' }}>{Math.abs(delta).toFixed(0)}% {delta <= 0 ? 'menos' : 'más'}</span> que {per.vs}.
@@ -431,6 +571,8 @@ function Dashboard() {
             <p className="text-[var(--muted)] mt-1">{error}. Revisa que tu usuario tenga una política de lectura en la tabla gastos.</p>
           </div>
         )}
+
+        <Resumen />
 
         {/* Flujo diario */}
         <section className="panel p-6 mb-6">
